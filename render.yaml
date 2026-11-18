@@ -12,8 +12,4 @@ services:
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: DB_PATH
-        value: /var/data/gayzone.sqlite3
-    disk:
-      name: bot-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: gayzone.sqlite3
