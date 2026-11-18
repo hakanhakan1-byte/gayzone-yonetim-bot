@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: gayzone-multigroup-moderation-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:api --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: DB_PATH
+        value: /var/data/gayzone.sqlite3
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
