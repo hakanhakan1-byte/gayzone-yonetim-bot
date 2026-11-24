@@ -2,8 +2,9 @@ import os, re, sqlite3, logging, time, asyncio, html
 from contextlib import closing
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatMemberStatus, ChatType
+from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeChatAdministrators
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +19,7 @@ LOG_CHAT_ID = int(LOG_CHAT_ID) if LOG_CHAT_ID else None
 api = FastAPI()
 bot_app = Application.builder().token(TOKEN).build()
 LINK_RE = re.compile(r'(?i)(https?://|www\.|t\.me/|telegram\.me/|(?:[a-z0-9-]+\.)+(?:com|net|org|ru|io|co|me|info|biz|app|gg)\b)')
-DEFAULTS = {'links':'on','welcome':'off','service_cleanup':'on','warn_limit':'3','mute_minutes':'60','flood_limit':'6'}
+DEFAULTS = {'links':'on','welcome':'off','service_cleanup':'on','age_gate':'on','warn_limit':'3','mute_minutes':'60','flood_limit':'6'}
 scheduler_task = None
 
 
@@ -30,9 +31,14 @@ def connect():
     con.execute('PRAGMA journal_mode=WAL')
     con.execute('CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id,key))')
     con.execute('CREATE TABLE IF NOT EXISTS words(chat_id INTEGER, word TEXT, PRIMARY KEY(chat_id,word))')
+    con.execute('CREATE TABLE IF NOT EXISTS allowed_links(chat_id INTEGER, value TEXT, PRIMARY KEY(chat_id,value))')
     con.execute('CREATE TABLE IF NOT EXISTS warnings(chat_id INTEGER, user_id INTEGER, count INTEGER NOT NULL, PRIMARY KEY(chat_id,user_id))')
     con.execute('CREATE TABLE IF NOT EXISTS bans(chat_id INTEGER, user_id INTEGER, username TEXT, full_name TEXT, created_at INTEGER, by_user INTEGER, PRIMARY KEY(chat_id,user_id))')
     con.execute('CREATE TABLE IF NOT EXISTS scheduled_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, text TEXT NOT NULL, interval_seconds INTEGER NOT NULL, next_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER)')
+    cols={r[1] for r in con.execute('PRAGMA table_info(scheduled_messages)')}
+    if 'photo_file_id' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN photo_file_id TEXT')
+    if 'media_kind' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN media_kind TEXT')
+    con.execute('CREATE TABLE IF NOT EXISTS age_checks(chat_id INTEGER, user_id INTEGER, confirmed_adult INTEGER NOT NULL DEFAULT 0, checked_at INTEGER, PRIMARY KEY(chat_id,user_id))')
     con.execute('CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, action TEXT, actor INTEGER, target INTEGER, created_at INTEGER)')
     con.execute('CREATE TABLE IF NOT EXISTS temp_bans(chat_id INTEGER, user_id INTEGER, expires_at INTEGER, PRIMARY KEY(chat_id,user_id))')
     con.commit()
@@ -53,6 +59,37 @@ def set_setting(chat_id,key,value):
 def words_for(chat_id):
     with closing(connect()) as con:
         return [r[0] for r in con.execute('SELECT word FROM words WHERE chat_id=?',(chat_id,))]
+
+
+def allowed_link_values(chat_id):
+    with closing(connect()) as con:
+        return [r[0] for r in con.execute('SELECT value FROM allowed_links WHERE chat_id=?',(chat_id,))]
+
+def link_is_allowed(text, chat_id):
+    low=text.casefold()
+    return any(v.casefold() in low for v in allowed_link_values(chat_id))
+
+async def linkizinle(update,context):
+    if not await admin_gate(update,context): return
+    value=' '.join(context.args).strip().casefold()
+    value=re.sub(r'^https?://','',value).strip().rstrip('/')
+    if not value:
+        await update.effective_message.reply_text('Kullanım: /linkizinle t.me/gayzoneee')
+        return
+    with closing(connect()) as con:
+        con.execute('INSERT OR IGNORE INTO allowed_links VALUES(?,?)',(update.effective_chat.id,value)); con.commit()
+    await update.effective_message.reply_text(f'İzinli bağlantı eklendi: {value}')
+
+async def linkizinsil(update,context):
+    if not await admin_gate(update,context): return
+    value=' '.join(context.args).strip().casefold()
+    value=re.sub(r'^https?://','',value).strip().rstrip('/')
+    if not value:
+        await update.effective_message.reply_text('Kullanım: /linkizinsil t.me/gayzoneee')
+        return
+    with closing(connect()) as con:
+        cur=con.execute('DELETE FROM allowed_links WHERE chat_id=? AND value=?',(update.effective_chat.id,value)); con.commit()
+    await update.effective_message.reply_text('İzin kaldırıldı.' if cur.rowcount else 'Bu izinli bağlantı bulunamadı.')
 
 
 def is_group(update):
@@ -87,6 +124,16 @@ async def audit(context, chat_id, action, actor=None, target=None):
         except Exception: log.exception('Audit channel error')
 
 
+async def delete_admin_command(update):
+    """Başarılı yönetim işlemlerinde komut mesajını gruptan kaldır."""
+    message = update.effective_message
+    if message:
+        try:
+            await message.delete()
+        except Exception:
+            log.exception('Admin command message could not be deleted')
+
+
 async def target_reply(update):
     reply = update.effective_message.reply_to_message
     if not reply or not reply.from_user:
@@ -96,7 +143,39 @@ async def target_reply(update):
 
 
 async def start(update, context):
-    await update.effective_message.reply_text('GAYZONE Yönetim Botu aktif. Beni grubuna ekle, yönetici yap ve /yardim yaz.')
+    await update.effective_message.reply_text('💎 GAYZONE Yönetim Botu aktif. Bilgi ve kullanım: /bilgi')
+
+
+async def bilgi(update, context):
+    await update.effective_message.reply_text(
+        '💎 GAYZONE BOT · V5\n\nBu bot grup güvenliği, moderasyon ve duyuru yönetimi içindir.\n'
+        'Üye komutları: /bilgi · /id · /yas18 (18 yaşından büyük olduğunu doğrulamak için)\n\n'
+        'Yönetim komutları grup yöneticilerine özeldir: /panel, /siktir, /unsiktir, /mute, /unmute, /warn, '
+        '/warns, /resetwarns, /kick, /duyuru, /fotoduyuru, /duyurular, /duyurudurdur, /duyurubaslat, '
+        '/duyuruduzenle, /duyurusil, /kelimeekle, /kelimesil, /kelimeler.\n\n'
+        'Güvenlik filtresi metin ve altyazıları inceler; fotoğraf/video içeriğinin kendisini otomatik analiz etmez.'
+    )
+
+
+async def yas18(update, context):
+    if not is_group(update):
+        await update.effective_message.reply_text('Yaş doğrulaması yalnızca grupta yapılabilir.')
+        return
+    if not update.effective_user: return
+    with closing(connect()) as con:
+        con.execute('INSERT INTO age_checks(chat_id,user_id,confirmed_adult,checked_at) VALUES(?,?,1,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET confirmed_adult=1,checked_at=excluded.checked_at', (update.effective_chat.id, update.effective_user.id, int(time.time())))
+        con.commit()
+    await update.effective_message.reply_text('18 yaşından büyük olduğunu beyan ettin. Yanlış beyan grup kurallarına aykırıdır.')
+
+
+async def set_command_menus(context, chat_id=None):
+    private=[BotCommand('bilgi','Bot hakkında bilgi'),BotCommand('id','Kullanıcı ve grup ID bilgisi'),BotCommand('yas18','18+ yaş beyanı')]
+    admin_commands=[BotCommand('panel','Premium yönetim paneli'),BotCommand('siktir','Üyeyi yasakla'),BotCommand('unsiktir','Yasağı kaldır'),BotCommand('warn','Uyar ve kalıcı sustur'),BotCommand('unmute','Susturmayı kaldır'),BotCommand('duyuru','Metin duyurusu oluştur'),BotCommand('fotoduyuru','Fotoğraflı duyuru oluştur'),BotCommand('duyurular','Duyuruları listele'),BotCommand('bilgi','Komut bilgileri')]
+    try:
+        await context.bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
+        await context.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+        if chat_id: await context.bot.set_my_commands(admin_commands, scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
+    except Exception: log.exception('Telegram command menu setup failed')
 
 
 async def help_cmd(update, context):
@@ -109,23 +188,51 @@ async def help_cmd(update, context):
         'DUYURU: /duyuru 20m Mesaj • /duyurular • /duyurudurdur ID • /duyurubaslat ID • /duyurusil ID\n'
         'AYAR: /panel • /link on|off • /hosgeldin on|off • /servismesaj on|off\n'
         'KELİME: /kelimeekle kelime • /kelimesil kelime • /kelimeler • /durum\n\n'
-        'Not: Küfür filtresi kapalıdır. Komutlar grup yöneticileri içindir.'
+        'Not: Yönetim komutları yalnızca grup yöneticilerine açıktır. /bilgi herkese açıktır.'
     )
 
 
 async def panel(update, context):
     if not await admin_gate(update,context): return
     c=update.effective_chat.id
-    buttons = [[InlineKeyboardButton('🔗 Link: '+setting(c,'links'),callback_data='toggle:links'), InlineKeyboardButton('👋 Hoş geldin: '+setting(c,'welcome'),callback_data='toggle:welcome')],
-               [InlineKeyboardButton('🧹 Servis mesajı: '+setting(c,'service_cleanup'),callback_data='toggle:service_cleanup')],
-               [InlineKeyboardButton('📢 Duyurular',callback_data='announcements'),InlineKeyboardButton('🚫 Ban listesi',callback_data='banlist:0')]]
-    await update.effective_message.reply_text(f'⚙️ {update.effective_chat.title or "Grup"} yönetim paneli',reply_markup=InlineKeyboardMarkup(buttons))
+    await set_command_menus(context,c)
+    buttons = [
+      [InlineKeyboardButton('👥 ÜYE YÖNETİMİ',callback_data='panel:members'),InlineKeyboardButton('🛡 GÜVENLİK',callback_data='panel:safety')],
+      [InlineKeyboardButton('📢 DUYURULAR',callback_data='announcements'),InlineKeyboardButton('🚫 BAN LİSTESİ',callback_data='banlist:0')],
+      [InlineKeyboardButton('🔗 Link: '+setting(c,'links'),callback_data='toggle:links'),InlineKeyboardButton('👋 Hoş geldin: '+setting(c,'welcome'),callback_data='toggle:welcome')],
+      [InlineKeyboardButton('🧹 Servis: '+setting(c,'service_cleanup'),callback_data='toggle:service_cleanup')]
+    ]
+    await update.effective_message.reply_text('💎 G A Y Z O N E\n━━━━━━━━━━━━━━\n⚙️ PREMIUM YÖNETİM MERKEZİ\n\nYönetim araçlarını aşağıdan seç.',reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def panel_callback(update, context):
     q=update.callback_query
     await q.answer()
     chat_id=q.message.chat_id
+    if q.data.startswith('age:'):
+        # Yaş beyanı yalnızca katılan kullanıcı tarafından verilebilir.
+        parts=q.data.split(':')
+        if len(parts) != 3 or not parts[2].isdigit():
+            await q.answer('Yaş doğrulama bağlantısı geçersiz.', show_alert=True)
+            return
+        action, expected_user_id = parts[1], int(parts[2])
+        if q.from_user.id != expected_user_id:
+            await q.answer('Bu yaş doğrulaması başka bir üyeye ait.', show_alert=True)
+            return
+        if action=='yes':
+            perms=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True)
+            try:
+                await context.bot.restrict_chat_member(chat_id,q.from_user.id,perms)
+                with closing(connect()) as con:
+                    con.execute('INSERT INTO age_checks(chat_id,user_id,confirmed_adult,checked_at) VALUES(?,?,1,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET confirmed_adult=1,checked_at=excluded.checked_at',(chat_id,q.from_user.id,int(time.time()))); con.commit()
+                await q.edit_message_text('18+ beyanın kaydedildi. GAYZONE kurallarına hoş geldin.')
+            except Exception: await q.answer('Yaş doğrulaması tamamlanamadı. Yöneticiyle iletişime geç.',show_alert=True)
+        else:
+            try:
+                await context.bot.ban_chat_member(chat_id,q.from_user.id)
+                await q.edit_message_text('18 yaş altı kullanıcılar GAYZONE grubuna katılamaz.')
+            except Exception: await q.answer('Çıkarma işlemi başarısız. Yöneticiyle iletişime geç.',show_alert=True)
+        return
     try:
         member=await context.bot.get_chat_member(chat_id,q.from_user.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):
@@ -149,7 +256,11 @@ async def panel_callback(update, context):
             await q.edit_message_text(f'{uid} kullanıcısının yasağı kaldırıldı.')
         except Exception as e: await q.answer(f'İşlem başarısız: {e}',show_alert=True)
     elif data=='announcements':
-        await q.edit_message_text('Duyuru oluşturmak için grupta şu komutu kullan:\n/duyuru 20m Mesajın\n\nListe: /duyurular')
+        await q.edit_message_text('📢 DUYURU MERKEZİ\nMetin: /duyuru 30m Mesaj\nFotoğraf: Fotoğrafa yanıt verip /fotoduyuru 1h\nListe: /duyurular\nDüzenle: /duyuruduzenle ID Yeni metin\nDurdur: /duyurudurdur ID')
+    elif data=='panel:members':
+        await q.edit_message_text('👥 ÜYE YÖNETİMİ\n/siktir (mesaja yanıt) · /unsiktir USER_ID\n/kick (yanıt) · /mute dakika (yanıt) · /unmute (yanıt)\n/warn (yanıt) · /warns (yanıt) · /resetwarns (yanıt)')
+    elif data=='panel:safety':
+        await q.edit_message_text('🛡 GÜVENLİK\n18+ kuralı: yeni üyeler butonla yaş beyan eder; 18 altı beyanı gruptan çıkarılır.\nYasaklı ifade: /kelimeekle ifade\nListe: /kelimeler\nLink filtresi: /link on veya /link off')
 
 
 async def panel_from_callback(q,chat_id):
@@ -186,7 +297,7 @@ async def ban_cmd(update, context):
         await context.bot.ban_chat_member(update.effective_chat.id,user.id)
         with closing(connect()) as con:
             con.execute('INSERT OR REPLACE INTO bans VALUES(?,?,?,?,?,?)',(update.effective_chat.id,user.id,user.username,user.full_name,int(time.time()),update.effective_user.id));con.commit()
-        await update.effective_message.reply_text(f'{user.full_name} gruptan yasaklandı.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'BAN',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Ban başarısız: {e}')
 
@@ -213,7 +324,7 @@ async def tempban(update,context):
         with closing(connect()) as con:
             con.execute('INSERT OR REPLACE INTO bans VALUES(?,?,?,?,?,?)',(update.effective_chat.id,user.id,user.username,user.full_name,int(time.time()),update.effective_user.id))
             con.execute('INSERT OR REPLACE INTO temp_bans VALUES(?,?,?)',(update.effective_chat.id,user.id,int(time.time())+mins*60)); con.commit()
-        await update.effective_message.reply_text(f'{user.full_name} {mins} dakika yasaklandı; süre bitince yasağı otomatik kaldırılacak.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'TEMPBAN',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Süreli ban başarısız: {e}')
 
@@ -226,7 +337,7 @@ async def unban(update, context):
     try:
         await context.bot.unban_chat_member(update.effective_chat.id,uid,only_if_banned=True)
         with closing(connect()) as con: con.execute('DELETE FROM bans WHERE chat_id=? AND user_id=?',(update.effective_chat.id,uid));con.commit()
-        await update.effective_message.reply_text(f'{uid} kullanıcısının yasağı kaldırıldı.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'UNBAN',update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f'Unban başarısız: {e}')
 
@@ -239,7 +350,7 @@ async def mute_user(update,context,temporary=False):
     mins=max(1,min(mins,10080))
     try:
         await context.bot.restrict_chat_member(update.effective_chat.id,user.id,ChatPermissions(can_send_messages=False),until_date=int(time.time())+mins*60)
-        await update.effective_message.reply_text(f'{user.full_name} {mins} dakika susturuldu.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'TEMPMUTE' if temporary else 'MUTE',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Susturma başarısız: {e}')
 
@@ -251,7 +362,7 @@ async def unmute(update,context):
     perms=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True)
     try:
         await context.bot.restrict_chat_member(update.effective_chat.id,user.id,perms)
-        await update.effective_message.reply_text(f'{user.full_name} susturması kaldırıldı.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'UNMUTE',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'İşlem başarısız: {e}')
 
@@ -263,7 +374,7 @@ async def kick(update,context):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id,user.id)
         await context.bot.unban_chat_member(update.effective_chat.id,user.id,only_if_banned=True)
-        await update.effective_message.reply_text(f'{user.full_name} gruptan çıkarıldı; yeniden katılabilir.')
+        await delete_admin_command(update)
         await audit(context,update.effective_chat.id,'KICK',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Çıkarma başarısız: {e}')
 
@@ -276,15 +387,11 @@ async def warn(update,context):
     with closing(connect()) as con:
         con.execute('INSERT INTO warnings VALUES(?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1',(cid,user.id));con.commit()
         count=con.execute('SELECT count FROM warnings WHERE chat_id=? AND user_id=?',(cid,user.id)).fetchone()[0]
-    limit=int(setting(cid,'warn_limit'))
-    if count>=limit:
-        mins=int(setting(cid,'mute_minutes'))
-        try:
-            await context.bot.restrict_chat_member(cid,user.id,ChatPermissions(can_send_messages=False),until_date=int(time.time())+mins*60)
-            await update.effective_message.reply_text(f'{user.full_name}: {count}/{limit} uyarı. {mins} dakika susturuldu.')
-        except Exception as e: await update.effective_message.reply_text(f'Uyarı kaydedildi ancak susturma başarısız: {e}')
-    else: await update.effective_message.reply_text(f'{user.full_name} uyarıldı ({count}/{limit}).')
-    await audit(context,cid,'WARN',update.effective_user.id,user.id)
+    try:
+        await context.bot.restrict_chat_member(cid,user.id,ChatPermissions(can_send_messages=False))
+        await delete_admin_command(update)
+    except Exception as e: await update.effective_message.reply_text(f'Uyarı kaydedildi ancak susturma başarısız: {e}')
+    await audit(context,cid,'WARN_PERMANENT_MUTE',update.effective_user.id,user.id)
 
 
 async def warnings(update,context):
@@ -314,6 +421,7 @@ async def unwarn(update,context):
 
 
 async def info(update,context):
+    if not await admin_gate(update,context): return
     user=await target_reply(update)
     if not user: return
     await update.effective_message.reply_text(f'Ad: {user.full_name}\nKullanıcı adı: @{user.username or "yok"}\nID: `{user.id}`',parse_mode='Markdown')
@@ -380,10 +488,10 @@ async def pinned(update,context):
 
 
 def parse_interval(raw):
-    match=re.fullmatch(r'(\d+)(s|sn|m|dk|h|sa|d|g)',raw.lower())
+    match=re.fullmatch(r'(\d+)(s|sn|m|dk|h|sa|d|g|dakika|saat|gun|gün)',raw.lower())
     if not match: return None
     n=int(match.group(1)); unit=match.group(2)
-    mult={'s':1,'sn':1,'m':60,'dk':60,'h':3600,'sa':3600,'d':86400,'g':86400}[unit]
+    mult={'s':1,'sn':1,'m':60,'dk':60,'dakika':60,'h':3600,'sa':3600,'saat':3600,'d':86400,'g':86400,'gun':86400,'gün':86400}[unit]
     seconds=n*mult
     if seconds<30: return -1
     return min(seconds, 30*86400)
@@ -406,14 +514,42 @@ async def announce(update,context):
     await audit(context,update.effective_chat.id,'ANNOUNCEMENT_CREATE',update.effective_user.id,sid)
 
 
+async def photo_announce(update,context):
+    if not await admin_gate(update,context): return
+    m=update.effective_message
+    source=m.reply_to_message
+    if not source or not source.photo:
+        await m.reply_text('Önce fotoğrafı gruba gönder, sonra fotoğraf mesajına yanıt verip /fotoduyuru 30m yaz.'); return
+    if not context.args:
+        await m.reply_text('Kullanım: fotoğrafa yanıt verip /fotoduyuru 30m'); return
+    interval=parse_interval(context.args[0])
+    if not interval or interval < 30:
+        await m.reply_text('Süre örnekleri: 1m, 30m, 1h, 2h, 1d. En kısa süre 1 dakikadır.'); return
+    caption=source.caption or ''
+    photo_id=source.photo[-1].file_id
+    with closing(connect()) as con:
+        cur=con.execute('INSERT INTO scheduled_messages(chat_id,text,interval_seconds,next_at,active,created_by,photo_file_id,media_kind) VALUES(?,?,?,?,1,?,?,?)',(update.effective_chat.id,caption,interval,int(time.time())+interval,update.effective_user.id,photo_id,'photo')); sid=cur.lastrowid; con.commit()
+    await m.reply_text(f'📸 Fotoğraflı duyuru #{sid} oluşturuldu. Her {context.args[0]} gönderilecek.')
+
+
+async def announcement_edit(update,context):
+    if not await admin_gate(update,context): return
+    if len(context.args)<2 or not context.args[0].isdigit():
+        await update.effective_message.reply_text('Kullanım: /duyuruduzenle ID Yeni duyuru metni'); return
+    sid=int(context.args[0]); new=' '.join(context.args[1:])
+    with closing(connect()) as con:
+        cur=con.execute('UPDATE scheduled_messages SET text=? WHERE id=? AND chat_id=?',(new,sid,update.effective_chat.id)); con.commit()
+    await update.effective_message.reply_text('Duyuru metni güncellendi.' if cur.rowcount else 'Duyuru bulunamadı.')
+
+
 async def announcements(update,context):
     if not await admin_gate(update,context):return
-    with closing(connect()) as con: rows=con.execute('SELECT id,text,interval_seconds,active FROM scheduled_messages WHERE chat_id=? ORDER BY id DESC',(update.effective_chat.id,)).fetchall()
+    with closing(connect()) as con: rows=con.execute('SELECT id,text,interval_seconds,active,photo_file_id FROM scheduled_messages WHERE chat_id=? ORDER BY id DESC',(update.effective_chat.id,)).fetchall()
     if not rows: await update.effective_message.reply_text('Henüz duyuru yok. Örnek: /duyuru 20m Mesaj');return
     lines=[]
-    for sid,text,secs,active in rows:
+    for sid,text,secs,active,photo_id in rows:
         unit=f'{secs}s' if secs<60 else (f'{secs//60}dk' if secs<3600 else (f'{secs//3600}sa' if secs<86400 else f'{secs//86400}g'))
-        lines.append(f'#{sid} | {"Aktif" if active else "Durdu"} | {unit} | {text[:70]}')
+        lines.append(f'#{sid} | {"Aktif" if active else "Durdu"} | {unit} | {"📸 Fotoğraf" if photo_id else text[:70]}')
     await update.effective_message.reply_text('📢 DUYURULAR\n'+'\n'.join(lines))
 
 
@@ -439,7 +575,7 @@ async def scheduler_loop():
         now=int(time.time())
         try:
             with closing(connect()) as con:
-                rows=con.execute('SELECT id,chat_id,text,interval_seconds FROM scheduled_messages WHERE active=1 AND next_at<=?',(now,)).fetchall()
+                rows=con.execute('SELECT id,chat_id,text,interval_seconds,photo_file_id FROM scheduled_messages WHERE active=1 AND next_at<=?',(now,)).fetchall()
                 expired=con.execute('SELECT chat_id,user_id FROM temp_bans WHERE expires_at<=?',(now,)).fetchall()
             for cid,uid in expired:
                 try:
@@ -448,9 +584,10 @@ async def scheduler_loop():
                         con.execute('DELETE FROM temp_bans WHERE chat_id=? AND user_id=?',(cid,uid))
                         con.execute('DELETE FROM bans WHERE chat_id=? AND user_id=?',(cid,uid)); con.commit()
                 except Exception: log.exception('Temporary ban expiry failed chat=%s user=%s',cid,uid)
-            for sid,cid,msg_text,interval in rows:
+            for sid,cid,msg_text,interval,photo_id in rows:
                 try:
-                    await bot_app.bot.send_message(cid,msg_text)
+                    if photo_id: await bot_app.bot.send_photo(cid,photo_id,caption=msg_text or None)
+                    else: await bot_app.bot.send_message(cid,msg_text)
                     with closing(connect()) as con: con.execute('UPDATE scheduled_messages SET next_at=? WHERE id=? AND active=1',(int(time.time())+interval,sid));con.commit()
                 except Exception:
                     log.exception('Scheduled message failed id=%s',sid)
@@ -502,10 +639,29 @@ async def moderate(update,context):
         if member.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):return
     except Exception:return
     text=(m.text or m.caption or '').casefold(); cid=update.effective_chat.id
-    # Küfür filtresi bilerek yok; yalnızca yöneticinin eklediği yasaklı kelimeler ve link ayarı uygulanır.
     match=next((w for w in words_for(cid) if w in text),None)
-    has_link=setting(cid,'links')=='on' and bool(LINK_RE.search(text))
-    if match or has_link:
+    # Çocuk güvenliği ve cinsel içerik takası: bağlamlı eşleşme; CP tek başına engellenmez.
+    safety_patterns=[
+      r'\bcp\b.{0,40}\b(takas|porno|porn|video|çocuk|cocuk|istismar)\b',
+      r'\b(takas|porno|porn|video|çocuk|cocuk|istismar)\b.{0,40}\bcp\b',
+      r'\b(çocuk|cocuk)\s*(pornosu|pornografisi|istismarı|istismari)\b',
+      r'\b(porno|porn|pornografi)\s*(takas|paylaşım|paylasim|video)\b',
+      r'\b(video|videolar)\s*(takas|değişimi|degisimi)\b',
+      r'\b(takas|değiş tokuş|degis tokus)\s*(video|porno|porn|cinsel içerik|cinsel icerik)\b',
+      r'\b(çocuk|cocuk).{0,35}(cinsel içerik|cinsel icerik|çıplak|ciplak|porno|pornografi)\b',
+      r'\b(cinsel içerik|cinsel icerik|çıplak|ciplak|porno|pornografi).{0,35}(çocuk|cocuk)\b'
+    ]
+    safety_match=any(re.search(p,text,re.I) for p in safety_patterns)
+    # Dış bağlantı, Telegram grup/kanal daveti ve profil bağlantıları.
+    # @kullanıcı adı tek başına engellenmez; grup reklamı/üye toplama bağlamı aranır.
+    recruit_context = bool(re.search(r'(?i)(grubumuza|kanalımıza|kanalımıza|gruba katıl|kanala katıl|üy(e|eleri) (çek|topla|davet)|uye (cek|topla|davet)|katılın|katilin|gelin|reklam|tanıtım|tanitim|takip edin|profilim|dm|özelden yaz)', text))
+    has_username = bool(re.search(r'(?<![\w])@[A-Za-z0-9_]{5,32}\b', text)) and recruit_context
+    has_telegram_profile = bool(re.search(r'(?i)(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[A-Za-z0-9_]{5,32}', text))
+    has_invite = bool(re.search(r'(?i)(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)', text))
+    has_external_link = bool(LINK_RE.search(text))
+    has_link = setting(cid,'links')=='on' and (has_external_link or has_username or has_telegram_profile or has_invite) and not link_is_allowed(text,cid)
+    recruitment_ad = recruit_context and (has_username or has_telegram_profile or has_invite or has_external_link)
+    if match or safety_match or has_link or recruitment_ad:
         try:
             await m.delete()
             with closing(connect()) as con:
@@ -517,32 +673,42 @@ async def moderate(update,context):
                 await context.bot.restrict_chat_member(cid,m.from_user.id,ChatPermissions(can_send_messages=False),until_date=int(time.time())+mins*60)
                 await context.bot.send_message(cid,f'{m.from_user.mention_html()} tekrarlanan ihlal nedeniyle {mins} dakika susturuldu. ({count}/{limit})',parse_mode='HTML')
             else:
-                reason='yasaklı kelime' if match else 'izinsiz bağlantı'
+                reason='çocuk güvenliği/cinsel içerik takası filtresi' if safety_match else ('yasaklı kelime' if match else ('grup/profil reklamı veya üye toplama' if recruitment_ad else 'izinsiz bağlantı'))
                 await context.bot.send_message(cid,f'{m.from_user.mention_html()} mesajı silindi ({reason}). Uyarı: {count}/{limit}.',parse_mode='HTML')
             await audit(context,cid,'AUTO_MOD',None,m.from_user.id)
         except Exception:log.exception('Moderation action failed')
 
 async def service_messages(update,context):
     if not is_group(update):return
-    if setting(update.effective_chat.id,'service_cleanup')!='on':return
     m=update.effective_message
     if m and (m.new_chat_members or m.left_chat_member):
         try:
-            if m.new_chat_members and setting(update.effective_chat.id,'welcome')=='on':
-                for u in m.new_chat_members: await context.bot.send_message(update.effective_chat.id,f'Hoş geldin, {u.full_name}! GAYZONE grubuna hoş geldin.')
-            await m.delete()
+            if m.new_chat_members:
+                for u in m.new_chat_members:
+                    if setting(update.effective_chat.id,'age_gate')=='on':
+                        try:
+                            await context.bot.restrict_chat_member(update.effective_chat.id,u.id,ChatPermissions(can_send_messages=False))
+                            kb=InlineKeyboardMarkup([[InlineKeyboardButton('18 yaşından büyüğüm',callback_data=f'age:yes:{u.id}')],[InlineKeyboardButton('18 yaşından küçüğüm',callback_data=f'age:no:{u.id}')]])
+                            await context.bot.send_message(update.effective_chat.id,f'🔞 {u.mention_html()} — GAYZONE yalnızca 18 yaş ve üzeri içindir. Devam etmek için yaşını beyan et:',parse_mode='HTML',reply_markup=kb)
+                        except Exception: log.exception('Age gate failed for user=%s',u.id)
+                    elif setting(update.effective_chat.id,'welcome')=='on':
+                        await context.bot.send_message(update.effective_chat.id,f'Hoş geldin, {u.full_name}! GAYZONE grubuna hoş geldin.')
+            # Telegram'ın katıldı/ayrıldı/çıkarıldı servis mesajları grup sohbetinde görünmesin.
+            # Botun yönetici olması ve mesaj silme izni bulunması gerekir.
+            if setting(update.effective_chat.id,'service_cleanup')=='on' or m.left_chat_member:
+                await m.delete()
         except Exception:log.exception('Service message handling failed')
 
 handlers=[
- CommandHandler('start',start),CommandHandler(['yardim','help'],help_cmd),CommandHandler('panel',panel),
- CommandHandler(['ban','banla'],ban_cmd),CommandHandler('banlist',banlist),CommandHandler('unban',unban),
+ CommandHandler('start',start),CommandHandler(['bilgi','yardim','help'],bilgi),CommandHandler('yas18',yas18),CommandHandler('panel',panel),
+ CommandHandler(['siktir','ban','banla'],ban_cmd),CommandHandler(['unsiktir','unban'],unban),CommandHandler('banlist',banlist),
  CommandHandler('mute',mute_user),CommandHandler('tempmute',lambda u,c: mute_user(u,c,True)),CommandHandler('unmute',unmute),
- CommandHandler('tempban',tempban),CommandHandler('kick',kick),CommandHandler('warn',warn),CommandHandler('warns',warnings),CommandHandler('warnings',warnings),CommandHandler('unwarn',unwarn),CommandHandler(['resetwarns','warnreset'],warnreset),
+ CommandHandler('tempban',tempban),CommandHandler('kick',kick),CommandHandler('warn',warn),CommandHandler(['warns','warnings'],warnings),CommandHandler('unwarn',unwarn),CommandHandler(['resetwarns','warnreset'],warnreset),
  CommandHandler('info',info),CommandHandler('id',id_cmd),CommandHandler(['del','temizle'],delete_cmd),CommandHandler('purge',purge),
  CommandHandler('pin',pin),CommandHandler('unpin',unpin),CommandHandler('unpinall',unpinall),CommandHandler('pinned',pinned),
- CommandHandler('duyuru',announce),CommandHandler('duyurular',announcements),CommandHandler('duyurudurdur',lambda u,c: announcement_action(u,c,'durdur')),
+ CommandHandler('duyuru',announce),CommandHandler('fotoduyuru',photo_announce),CommandHandler('duyuruduzenle',announcement_edit),CommandHandler('duyurular',announcements),CommandHandler('duyurudurdur',lambda u,c: announcement_action(u,c,'durdur')),
  CommandHandler('duyurubaslat',lambda u,c: announcement_action(u,c,'baslat')),CommandHandler('duyurusil',announcement_delete),
- CommandHandler('link',link_cmd),CommandHandler('hosgeldin',welcome_cmd),CommandHandler('servismesaj',service_cmd),
+ CommandHandler('link',link_cmd),CommandHandler('linkizinle',linkizinle),CommandHandler('linkizinsil',linkizinsil),CommandHandler('hosgeldin',welcome_cmd),CommandHandler('servismesaj',service_cmd),
  CommandHandler('kelimeekle',kelimeekle),CommandHandler('kelimesil',kelimesil),CommandHandler('kelimeler',kelimeler),CommandHandler('durum',durum),
  CallbackQueryHandler(panel_callback),MessageHandler(filters.StatusUpdate.ALL,service_messages),
  MessageHandler((filters.TEXT|filters.CAPTION)&~filters.COMMAND,moderate)
@@ -554,6 +720,7 @@ async def startup():
     global scheduler_task
     with closing(connect()): pass
     await bot_app.initialize(); await bot_app.start()
+    await set_command_menus(type('Ctx',(),{'bot':bot_app.bot})())
     if BASE_URL:
         await bot_app.bot.set_webhook(url=f'{BASE_URL}/telegram',secret_token=WEBHOOK_SECRET,allowed_updates=Update.ALL_TYPES)
     else: log.warning('RENDER_EXTERNAL_URL not set; webhook not configured')
