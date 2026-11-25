@@ -38,6 +38,8 @@ def connect():
     cols={r[1] for r in con.execute('PRAGMA table_info(scheduled_messages)')}
     if 'photo_file_id' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN photo_file_id TEXT')
     if 'media_kind' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN media_kind TEXT')
+    if 'button_text' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN button_text TEXT')
+    if 'button_url' not in cols: con.execute('ALTER TABLE scheduled_messages ADD COLUMN button_url TEXT')
     con.execute('CREATE TABLE IF NOT EXISTS age_checks(chat_id INTEGER, user_id INTEGER, confirmed_adult INTEGER NOT NULL DEFAULT 0, checked_at INTEGER, PRIMARY KEY(chat_id,user_id))')
     con.execute('CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, action TEXT, actor INTEGER, target INTEGER, created_at INTEGER)')
     con.execute('CREATE TABLE IF NOT EXISTS temp_bans(chat_id INTEGER, user_id INTEGER, expires_at INTEGER, PRIMARY KEY(chat_id,user_id))')
@@ -286,6 +288,8 @@ async def set_command_menus(context, chat_id=None):
         BotCommand('duyurular', 'Duyuruları listele'),
         BotCommand('duyurudurdur', 'Duyuruyu durdur'),
         BotCommand('duyurubaslat', 'Duyuruyu başlat'),
+        BotCommand('duyurubuton', 'Duyuruya URL butonu ekle'),
+        BotCommand('duyurubutonsil', 'Duyurudan URL butonunu kaldır'),
         BotCommand('duyuruduzenle', 'Duyuruyu düzenle'),
         BotCommand('duyurusil', 'Duyuruyu sil'),
         BotCommand('link', 'Link filtresi'),
@@ -320,7 +324,7 @@ async def help_cmd(update, context):
         '/mute dakika (yanıt) • /unmute (yanıt) • /tempban dakika (yanıt) • /tempmute dakika (yanıt)\n'
         '/warn (yanıt) • /unwarn (yanıt) • /warns (yanıt) • /resetwarns (yanıt) • /info (yanıt) • /id\n\n'
         'MESAJ: /del (yanıt) • /purge (yanıt) • /pin (yanıt) • /unpin • /unpinall • /pinned\n'
-        'DUYURU: /duyuru 20m Mesaj • /duyurular • /duyurudurdur ID • /duyurubaslat ID • /duyurusil ID\n'
+        'DUYURU: /duyuru 20m Mesaj • /duyurular • /duyurudurdur ID • /duyurubaslat ID • /duyurubuton ID Buton | URL • /duyurubutonsil ID • /duyurusil ID\n'
         'AYAR: /panel • /link on|off • /hosgeldin on|off • /servismesaj on|off\n'
         'KELİME: /kelimeekle kelime • /kelimesil kelime • /kelimeler • /durum\n\n'
         'Not: Yönetim komutları yalnızca grup yöneticilerine açıktır. /bilgi herkese açıktır.'
@@ -851,11 +855,11 @@ async def photo_announce(update,context):
     interval=parse_interval(context.args[0])
     if not interval or interval < 30:
         await m.reply_text('Süre örnekleri: 1m, 30m, 1h, 2h, 1d. En kısa süre 1 dakikadır.'); return
-    caption=source.caption or ''
+    caption=' '.join(context.args[1:]).strip() if len(context.args)>1 else (source.caption or '')
     photo_id=source.photo[-1].file_id
     with closing(connect()) as con:
         cur=con.execute('INSERT INTO scheduled_messages(chat_id,text,interval_seconds,next_at,active,created_by,photo_file_id,media_kind) VALUES(?,?,?,?,1,?,?,?)',(update.effective_chat.id,caption,interval,int(time.time())+interval,update.effective_user.id,photo_id,'photo')); sid=cur.lastrowid; con.commit()
-    await m.reply_text(f'📸 Fotoğraflı duyuru #{sid} oluşturuldu. Her {context.args[0]} gönderilecek.')
+    await m.reply_text(f'📸 Fotoğraflı duyuru #{sid} oluşturuldu. Her {context.args[0]} gönderilecek.\nButon eklemek: /duyurubuton {sid} Buton adı | https://...')
 
 
 async def announcement_edit(update,context):
@@ -868,14 +872,80 @@ async def announcement_edit(update,context):
     await update.effective_message.reply_text('Duyuru metni güncellendi.' if cur.rowcount else 'Duyuru bulunamadı.')
 
 
+async def announcement_button(update,context):
+    if not await admin_gate(update,context): return
+    raw=' '.join(context.args).strip()
+    if not raw or not context.args[0].isdigit() or '|' not in raw:
+        await update.effective_message.reply_text('Kullanım: /duyurubuton ID Buton adı | https://t.me/...'); return
+    sid=int(context.args[0])
+    details=raw[len(context.args[0]):].strip()
+    button_text,button_url=[part.strip() for part in details.split('|',1)]
+    if not button_text or not re.match(r'^https?://\S+$',button_url):
+        await update.effective_message.reply_text('Buton adı boş olamaz. URL http:// veya https:// ile başlamalı.'); return
+    if len(button_text)>64:
+        await update.effective_message.reply_text('Buton adı en fazla 64 karakter olabilir.'); return
+    # Save the button and immediately publish the configured announcement with it.
+    # This avoids the confusing case where the button is saved but only appears
+    # on the next scheduled repetition. The existing schedule/interval is kept.
+    with closing(connect()) as con:
+        cur=con.execute(
+            'UPDATE scheduled_messages SET button_text=?,button_url=? WHERE id=? AND chat_id=?',
+            (button_text,button_url,sid,update.effective_chat.id)
+        )
+        row=con.execute(
+            'SELECT text,photo_file_id FROM scheduled_messages WHERE id=? AND chat_id=?',
+            (sid,update.effective_chat.id)
+        ).fetchone()
+        con.commit()
+    if not cur.rowcount or not row:
+        await update.effective_message.reply_text('Bu grupta böyle bir duyuru bulunamadı.')
+        return
+    msg_text,photo_id=row
+    markup=InlineKeyboardMarkup([[InlineKeyboardButton(button_text,url=button_url)]])
+    try:
+        if photo_id:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=photo_id,
+                caption=msg_text or None,
+                reply_markup=markup
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=msg_text,
+                reply_markup=markup
+            )
+        await update.effective_message.reply_text(
+            '🔗 Katıl butonu eklendi ve duyuru butonla birlikte şimdi gruba gönderildi. '
+            'Mevcut tekrar süresi ve diğer duyuru ayarları korunuyor.'
+        )
+    except Exception:
+        log.exception('Could not immediately publish announcement with URL button id=%s',sid)
+        await update.effective_message.reply_text(
+            'Buton kaydedildi; ancak duyuru şimdi gönderilemedi. '
+            'Botun grupta mesaj/fotoğraf gönderme iznini kontrol et.'
+        )
+
+
+async def announcement_button_remove(update,context):
+    if not await admin_gate(update,context): return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text('Kullanım: /duyurubutonsil ID'); return
+    sid=int(context.args[0])
+    with closing(connect()) as con:
+        cur=con.execute('UPDATE scheduled_messages SET button_text=NULL,button_url=NULL WHERE id=? AND chat_id=?',(sid,update.effective_chat.id)); con.commit()
+    await update.effective_message.reply_text('Duyuru butonu kaldırıldı.' if cur.rowcount else 'Bu grupta böyle bir duyuru bulunamadı.')
+
+
 async def announcements(update,context):
     if not await admin_gate(update,context):return
-    with closing(connect()) as con: rows=con.execute('SELECT id,text,interval_seconds,active,photo_file_id FROM scheduled_messages WHERE chat_id=? ORDER BY id DESC',(update.effective_chat.id,)).fetchall()
+    with closing(connect()) as con: rows=con.execute('SELECT id,text,interval_seconds,active,photo_file_id,button_text FROM scheduled_messages WHERE chat_id=? ORDER BY id DESC',(update.effective_chat.id,)).fetchall()
     if not rows: await update.effective_message.reply_text('Henüz duyuru yok. Örnek: /duyuru 20m Mesaj');return
     lines=[]
-    for sid,text,secs,active,photo_id in rows:
+    for sid,text,secs,active,photo_id,button_text in rows:
         unit=f'{secs}s' if secs<60 else (f'{secs//60}dk' if secs<3600 else (f'{secs//3600}sa' if secs<86400 else f'{secs//86400}g'))
-        lines.append(f'#{sid} | {"Aktif" if active else "Durdu"} | {unit} | {"📸 Fotoğraf" if photo_id else text[:70]}')
+        lines.append(f'#{sid} | {"Aktif" if active else "Durdu"} | {unit} | {"📸 Fotoğraf" if photo_id else text[:70]}{" | 🔗 "+button_text if button_text else ""}')
     await update.effective_message.reply_text('📢 DUYURULAR\n'+'\n'.join(lines))
 
 
@@ -901,7 +971,7 @@ async def scheduler_loop():
         now=int(time.time())
         try:
             with closing(connect()) as con:
-                rows=con.execute('SELECT id,chat_id,text,interval_seconds,photo_file_id FROM scheduled_messages WHERE active=1 AND next_at<=?',(now,)).fetchall()
+                rows=con.execute('SELECT id,chat_id,text,interval_seconds,photo_file_id,button_text,button_url FROM scheduled_messages WHERE active=1 AND next_at<=?',(now,)).fetchall()
                 expired=con.execute('SELECT chat_id,user_id FROM temp_bans WHERE expires_at<=?',(now,)).fetchall()
             for cid,uid in expired:
                 try:
@@ -910,10 +980,11 @@ async def scheduler_loop():
                         con.execute('DELETE FROM temp_bans WHERE chat_id=? AND user_id=?',(cid,uid))
                         con.execute('DELETE FROM bans WHERE chat_id=? AND user_id=?',(cid,uid)); con.commit()
                 except Exception: log.exception('Temporary ban expiry failed chat=%s user=%s',cid,uid)
-            for sid,cid,msg_text,interval,photo_id in rows:
+            for sid,cid,msg_text,interval,photo_id,button_text,button_url in rows:
                 try:
-                    if photo_id: await bot_app.bot.send_photo(cid,photo_id,caption=msg_text or None)
-                    else: await bot_app.bot.send_message(cid,msg_text)
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(button_text,url=button_url)]]) if button_text and button_url else None
+                    if photo_id: await bot_app.bot.send_photo(cid,photo_id,caption=msg_text or None,reply_markup=reply_markup)
+                    else: await bot_app.bot.send_message(cid,msg_text,reply_markup=reply_markup)
                     with closing(connect()) as con: con.execute('UPDATE scheduled_messages SET next_at=? WHERE id=? AND active=1',(int(time.time())+interval,sid));con.commit()
                 except Exception:
                     log.exception('Scheduled message failed id=%s',sid)
@@ -1030,7 +1101,7 @@ handlers=[
  CommandHandler('info',info),CommandHandler('id',id_cmd),CommandHandler(['del','temizle'],delete_cmd),CommandHandler('purge',purge),
  CommandHandler('pin',pin),CommandHandler('unpin',unpin),CommandHandler('unpinall',unpinall),CommandHandler('pinned',pinned),
  CommandHandler('duyuru',announce),CommandHandler('fotoduyuru',photo_announce),CommandHandler('duyuruduzenle',announcement_edit),CommandHandler('duyurular',announcements),CommandHandler('duyurudurdur',lambda u,c: announcement_action(u,c,'durdur')),
- CommandHandler('duyurubaslat',lambda u,c: announcement_action(u,c,'baslat')),CommandHandler('duyurusil',announcement_delete),
+ CommandHandler('duyurubaslat',lambda u,c: announcement_action(u,c,'baslat')),CommandHandler('duyurubuton',announcement_button),CommandHandler('duyurubutonsil',announcement_button_remove),CommandHandler('duyurusil',announcement_delete),
  CommandHandler('link',link_cmd),CommandHandler('linkizinle',linkizinle),CommandHandler('linkizinsil',linkizinsil),CommandHandler('hosgeldin',welcome_cmd),CommandHandler('servismesaj',service_cmd),
  CommandHandler('kelimeekle',kelimeekle),CommandHandler('kelimesil',kelimesil),CommandHandler('kelimeler',kelimeler),CommandHandler('durum',durum),
  CallbackQueryHandler(panel_callback),MessageHandler(filters.StatusUpdate.ALL,service_messages),
