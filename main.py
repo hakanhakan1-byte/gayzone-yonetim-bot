@@ -41,6 +41,8 @@ def connect():
     con.execute('CREATE TABLE IF NOT EXISTS age_checks(chat_id INTEGER, user_id INTEGER, confirmed_adult INTEGER NOT NULL DEFAULT 0, checked_at INTEGER, PRIMARY KEY(chat_id,user_id))')
     con.execute('CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, action TEXT, actor INTEGER, target INTEGER, created_at INTEGER)')
     con.execute('CREATE TABLE IF NOT EXISTS temp_bans(chat_id INTEGER, user_id INTEGER, expires_at INTEGER, PRIMARY KEY(chat_id,user_id))')
+    con.execute('CREATE TABLE IF NOT EXISTS known_users(chat_id INTEGER, user_id INTEGER, username TEXT, full_name TEXT, last_seen INTEGER, PRIMARY KEY(chat_id,user_id))')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_known_users_username ON known_users(chat_id, username)')
     con.commit()
     return con
 
@@ -124,14 +126,44 @@ async def audit(context, chat_id, action, actor=None, target=None):
         except Exception: log.exception('Audit channel error')
 
 
-async def delete_admin_command(update):
-    """Başarılı yönetim işlemlerinde komut mesajını gruptan kaldır."""
+def remember_group_user(chat_id, user):
+    if not user or user.is_bot:
+        return
+    username = (user.username or '').lstrip('@').casefold()
+    with closing(connect()) as con:
+        con.execute(
+            'INSERT INTO known_users(chat_id,user_id,username,full_name,last_seen) VALUES(?,?,?,?,?) '
+            'ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, '
+            'full_name=excluded.full_name,last_seen=excluded.last_seen',
+            (chat_id, user.id, username, user.full_name, int(time.time()))
+        )
+        con.commit()
+
+
+def known_user_by_username(chat_id, username):
+    normalized = username.lstrip('@').casefold()
+    with closing(connect()) as con:
+        return con.execute(
+            'SELECT user_id, username, full_name FROM known_users '
+            'WHERE chat_id=? AND username=? ORDER BY last_seen DESC LIMIT 1',
+            (chat_id, normalized)
+        ).fetchone()
+
+
+async def track_group_user(update, context):
     message = update.effective_message
-    if message:
+    chat = update.effective_chat
+    if not chat or not message:
+        return
+    if message.from_user:
         try:
-            await message.delete()
+            remember_group_user(chat.id, message.from_user)
         except Exception:
-            log.exception('Admin command message could not be deleted')
+            log.exception('Could not cache group user')
+    configured = context.bot_data.setdefault('command_menu_chats', set())
+    if chat.id not in configured:
+        if await set_command_menus(context, chat.id):
+            configured.add(chat.id)
 
 
 async def target_reply(update):
@@ -142,20 +174,49 @@ async def target_reply(update):
     return reply.from_user
 
 
+async def moderation_bot_permission(update, context):
+    """Confirm the bot can restrict/ban members before attempting the action."""
+    chat_id = update.effective_chat.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if member.status == ChatMemberStatus.OWNER:
+            return True
+        if member.status != ChatMemberStatus.ADMINISTRATOR or not getattr(member, 'can_restrict_members', False):
+            await update.effective_message.reply_text(
+                'Botun banlama/susturma izni yok. Grupta botu yönetici yapıp '
+                '“Üyeleri yasakla” iznini aç.'
+            )
+            return False
+        return True
+    except Exception as e:
+        log.exception('Could not check bot moderation permissions')
+        await update.effective_message.reply_text(f'Bot izinleri kontrol edilemedi: {e}')
+        return False
+
+
+async def delete_command_after_success(update):
+    """Delete only the command message, and only after Telegram action succeeded."""
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        log.exception('Moderation succeeded but command message could not be deleted')
+
+
+async def safe_audit(context, chat_id, action, actor=None, target=None):
+    try:
+        await audit(context, chat_id, action, actor, target)
+    except Exception:
+        # Logging/audit failure must never make a successful Telegram action look failed.
+        log.exception('Audit write failed after successful moderation action')
+
+
 async def start(update, context):
     await update.effective_message.reply_text('💎 GAYZONE Yönetim Botu aktif. Bilgi ve kullanım: /bilgi')
 
 
 async def bilgi(update, context):
-    await update.effective_message.reply_text(
-        '💎 GAYZONE BOT · V5\n\nBu bot grup güvenliği, moderasyon ve duyuru yönetimi içindir.\n'
-        'Üye komutları: /bilgi · /id · /yas18 (18 yaşından büyük olduğunu doğrulamak için)\n\n'
-        'Yönetim komutları grup yöneticilerine özeldir: /panel, /siktir, /unsiktir, /mute, /unmute, /warn, '
-        '/warns, /resetwarns, /kick, /duyuru, /fotoduyuru, /duyurular, /duyurudurdur, /duyurubaslat, '
-        '/duyuruduzenle, /duyurusil, /kelimeekle, /kelimesil, /kelimeler.\n\n'
-        'Güvenlik filtresi metin ve altyazıları inceler; fotoğraf/video içeriğinin kendisini otomatik analiz etmez.'
-    )
-
+    # /bilgi now opens the same management panel as /panel.
+    await panel(update, context)
 
 async def yas18(update, context):
     if not is_group(update):
@@ -169,13 +230,71 @@ async def yas18(update, context):
 
 
 async def set_command_menus(context, chat_id=None):
-    private=[BotCommand('bilgi','Bot hakkında bilgi'),BotCommand('id','Kullanıcı ve grup ID bilgisi'),BotCommand('yas18','18+ yaş beyanı')]
-    admin_commands=[BotCommand('panel','Premium yönetim paneli'),BotCommand('siktir','Üyeyi yasakla'),BotCommand('unsiktir','Yasağı kaldır'),BotCommand('warn','Uyar ve kalıcı sustur'),BotCommand('unmute','Susturmayı kaldır'),BotCommand('duyuru','Metin duyurusu oluştur'),BotCommand('fotoduyuru','Fotoğraflı duyuru oluştur'),BotCommand('duyurular','Duyuruları listele'),BotCommand('bilgi','Komut bilgileri')]
+    private = [
+        BotCommand('bilgi', 'Yönetim panelini aç'),
+        BotCommand('id', 'Kullanıcı ve grup ID bilgisi'),
+        BotCommand('yas18', '18+ yaş beyanı'),
+    ]
+    # Normal group members see only public commands. Administrators receive
+    # the larger command list through the more-specific ChatAdministrators scope.
+    group_public = [
+        BotCommand('bilgi', 'Yönetim panelini aç'),
+        BotCommand('id', 'Kullanıcı ve grup ID bilgisi'),
+        BotCommand('yas18', '18+ yaş beyanı'),
+    ]
+    admin_commands = [
+        BotCommand('panel', 'Yönetim paneli'),
+        BotCommand('siktir', 'Üyeyi yasakla'),
+        BotCommand('unsiktir', 'Yasağı kaldır'),
+        BotCommand('banlist', 'Yasaklı üyeler'),
+        BotCommand('kick', 'Üyeyi gruptan çıkar'),
+        BotCommand('mute', 'Üyeyi sustur'),
+        BotCommand('var', 'Üyeyi sustur'),
+        BotCommand('tempmute', 'Süreli sustur'),
+        BotCommand('unmute', 'Susturmayı kaldır'),
+        BotCommand('tempban', 'Süreli yasak'),
+        BotCommand('warn', 'Uyarı ver'),
+        BotCommand('uyar', 'Uyarı ver'),
+        BotCommand('warns', 'Uyarı geçmişi'),
+        BotCommand('unwarn', 'Uyarı azalt'),
+        BotCommand('resetwarns', 'Uyarıları sıfırla'),
+        BotCommand('info', 'Üye bilgisi'),
+        BotCommand('del', 'Mesaj sil'),
+        BotCommand('purge', 'Toplu mesaj sil'),
+        BotCommand('pin', 'Mesaj sabitle'),
+        BotCommand('unpin', 'Sabitlemeyi kaldır'),
+        BotCommand('unpinall', 'Tüm sabitlemeleri kaldır'),
+        BotCommand('pinned', 'Sabitli mesajı göster'),
+        BotCommand('duyuru', 'Tekrarlı metin duyurusu'),
+        BotCommand('fotoduyuru', 'Tekrarlı foto duyurusu'),
+        BotCommand('duyurular', 'Duyuruları listele'),
+        BotCommand('duyurudurdur', 'Duyuruyu durdur'),
+        BotCommand('duyurubaslat', 'Duyuruyu başlat'),
+        BotCommand('duyuruduzenle', 'Duyuruyu düzenle'),
+        BotCommand('duyurusil', 'Duyuruyu sil'),
+        BotCommand('link', 'Link filtresi'),
+        BotCommand('hosgeldin', 'Hoş geldin mesajı'),
+        BotCommand('servismesaj', 'Servis mesajları'),
+        BotCommand('kelimeekle', 'Yasaklı kelime ekle'),
+        BotCommand('kelimesil', 'Yasaklı kelime sil'),
+        BotCommand('kelimeler', 'Yasaklı kelimeler'),
+        BotCommand('durum', 'Grup ayarları'),
+        BotCommand('bilgi', 'Bot bilgisi'),
+        BotCommand('id', 'ID bilgisi'),
+    ]
     try:
         await context.bot.set_my_commands(private, scope=BotCommandScopeAllPrivateChats())
-        await context.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
-        if chat_id: await context.bot.set_my_commands(admin_commands, scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
-    except Exception: log.exception('Telegram command menu setup failed')
+        await context.bot.set_my_commands(group_public, scope=BotCommandScopeAllGroupChats())
+        if chat_id:
+            await context.bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChatAdministrators(chat_id=chat_id)
+            )
+        log.info('Telegram command menus registered (chat_id=%s)', chat_id)
+        return True
+    except Exception:
+        log.exception('Telegram command menu setup failed')
+        return False
 
 
 async def help_cmd(update, context):
@@ -210,28 +329,28 @@ async def panel_callback(update, context):
     await q.answer()
     chat_id=q.message.chat_id
     if q.data.startswith('age:'):
-        # Yaş beyanı yalnızca katılan kullanıcı tarafından verilebilir.
+        # Yaş beyanı yalnızca yeni katılan kişinin kendi düğmesine basmasıyla alınır.
         parts=q.data.split(':')
-        if len(parts) != 3 or not parts[2].isdigit():
-            await q.answer('Yaş doğrulama bağlantısı geçersiz.', show_alert=True)
-            return
-        action, expected_user_id = parts[1], int(parts[2])
-        if q.from_user.id != expected_user_id:
-            await q.answer('Bu yaş doğrulaması başka bir üyeye ait.', show_alert=True)
-            return
+        if len(parts)!=3 or not parts[2].isdigit():
+            await q.answer('Yaş doğrulama bağlantısı geçersiz.',show_alert=True); return
+        action,target_id=parts[1],int(parts[2])
+        if q.from_user.id != target_id:
+            await q.answer('Bu yaş beyanı başka bir üyeye ait. Kendi katılım mesajındaki düğmeye bas.',show_alert=True); return
         if action=='yes':
             perms=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True)
             try:
-                await context.bot.restrict_chat_member(chat_id,q.from_user.id,perms)
+                await context.bot.restrict_chat_member(chat_id,target_id,perms)
                 with closing(connect()) as con:
-                    con.execute('INSERT INTO age_checks(chat_id,user_id,confirmed_adult,checked_at) VALUES(?,?,1,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET confirmed_adult=1,checked_at=excluded.checked_at',(chat_id,q.from_user.id,int(time.time()))); con.commit()
-                await q.edit_message_text('18+ beyanın kaydedildi. GAYZONE kurallarına hoş geldin.')
-            except Exception: await q.answer('Yaş doğrulaması tamamlanamadı. Yöneticiyle iletişime geç.',show_alert=True)
-        else:
+                    con.execute('INSERT INTO age_checks(chat_id,user_id,confirmed_adult,checked_at) VALUES(?,?,1,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET confirmed_adult=1,checked_at=excluded.checked_at',(chat_id,target_id,int(time.time()))); con.commit()
+                await q.edit_message_text('18+ yaş beyanın kaydedildi. GAYZONE kurallarına hoş geldin.')
+            except Exception: await q.answer('Yaş beyanı kaydedilemedi. Yöneticiyle iletişime geç.',show_alert=True)
+        elif action=='no':
             try:
-                await context.bot.ban_chat_member(chat_id,q.from_user.id)
+                await context.bot.ban_chat_member(chat_id,target_id)
                 await q.edit_message_text('18 yaş altı kullanıcılar GAYZONE grubuna katılamaz.')
-            except Exception: await q.answer('Çıkarma işlemi başarısız. Yöneticiyle iletişime geç.',show_alert=True)
+            except Exception: await q.answer('Gruptan çıkarma işlemi başarısız. Yöneticiyle iletişime geç.',show_alert=True)
+        else:
+            await q.answer('Yaş seçimi geçersiz.',show_alert=True)
         return
     try:
         member=await context.bot.get_chat_member(chat_id,q.from_user.id)
@@ -288,19 +407,68 @@ async def show_banlist(q,chat_id,page=0):
 
 
 async def ban_cmd(update, context):
-    if not await admin_gate(update,context): return
-    user=await target_reply(update)
-    if not user:return
-    if user.id==update.effective_user.id:
-        await update.effective_message.reply_text('Kendini yasaklayamazsın.');return
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id,user.id)
-        with closing(connect()) as con:
-            con.execute('INSERT OR REPLACE INTO bans VALUES(?,?,?,?,?,?)',(update.effective_chat.id,user.id,user.username,user.full_name,int(time.time()),update.effective_user.id));con.commit()
-        await delete_admin_command(update)
-        await audit(context,update.effective_chat.id,'BAN',update.effective_user.id,user.id)
-    except Exception as e: await update.effective_message.reply_text(f'Ban başarısız: {e}')
+    if not await admin_gate(update, context):
+        return
+    if not await moderation_bot_permission(update, context):
+        return
 
+    chat_id = update.effective_chat.id
+    message = update.effective_message
+    target_id = None
+    target_username = None
+    target_name = None
+
+    # Usage: reply /siktir, or /siktir USER_ID, or /siktir @username (known users only).
+    if context.args:
+        raw = context.args[0].strip()
+        if raw.lstrip('-').isdigit():
+            target_id = int(raw)
+        elif raw.startswith('@'):
+            found = known_user_by_username(chat_id, raw)
+            if not found:
+                await message.reply_text(
+                    'Bu kullanıcıyı tanımıyorum. Üyenin mesajına yanıt vererek /siktir yaz '
+                    'veya kullanıcı ID’sini kullan.'
+                )
+                return
+            target_id, target_username, target_name = found
+        else:
+            await message.reply_text('Kullanım: üyeye yanıt verip /siktir veya /siktir USER_ID')
+            return
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        user = message.reply_to_message.from_user
+        target_id, target_username, target_name = user.id, user.username, user.full_name
+    else:
+        await message.reply_text('Banlamak istediğin kişinin mesajına yanıt verip /siktir yaz. ID ile: /siktir USER_ID')
+        return
+
+    if target_id == update.effective_user.id:
+        await message.reply_text('Kendini yasaklayamazsın.')
+        return
+    if target_id == context.bot.id:
+        await message.reply_text('Bot kendisini yasaklayamaz.')
+        return
+
+    try:
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+    except Exception as e:
+        log.exception('Ban failed chat=%s target=%s', chat_id, target_id)
+        await message.reply_text(f'Ban başarısız. Bot yönetici ve “Üyeleri yasakla” iznine sahip mi kontrol et.\nTelegram: {e}')
+        return
+
+    # Telegram ban succeeded. Database/audit errors are secondary and cannot undo it.
+    try:
+        with closing(connect()) as con:
+            con.execute(
+                'INSERT OR REPLACE INTO bans VALUES(?,?,?,?,?,?)',
+                (chat_id, target_id, target_username, target_name, int(time.time()), update.effective_user.id)
+            )
+            con.commit()
+    except Exception:
+        log.exception('Ban succeeded but local ban record failed')
+    await delete_command_after_success(update)
+    await context.bot.send_message(chat_id, f'{target_name or target_username or target_id} gruptan yasaklandı.')
+    await safe_audit(context, chat_id, 'BAN', update.effective_user.id, target_id)
 
 async def banlist(update,context):
     if not await admin_gate(update,context):return
@@ -324,48 +492,112 @@ async def tempban(update,context):
         with closing(connect()) as con:
             con.execute('INSERT OR REPLACE INTO bans VALUES(?,?,?,?,?,?)',(update.effective_chat.id,user.id,user.username,user.full_name,int(time.time()),update.effective_user.id))
             con.execute('INSERT OR REPLACE INTO temp_bans VALUES(?,?,?)',(update.effective_chat.id,user.id,int(time.time())+mins*60)); con.commit()
-        await delete_admin_command(update)
+        await update.effective_message.reply_text(f'{user.full_name} {mins} dakika yasaklandı; süre bitince yasağı otomatik kaldırılacak.')
         await audit(context,update.effective_chat.id,'TEMPBAN',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Süreli ban başarısız: {e}')
 
 
 async def unban(update, context):
-    if not await admin_gate(update,context):return
-    if not context.args or not context.args[0].lstrip('-').isdigit():
-        await update.effective_message.reply_text('Kullanım: /unban USER_ID');return
-    uid=int(context.args[0])
+    if not await admin_gate(update, context):
+        return
+    if not await moderation_bot_permission(update, context):
+        return
+
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    uid = None
+    if context.args and context.args[0].lstrip('-').isdigit():
+        uid = int(context.args[0])
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        uid = message.reply_to_message.from_user.id
+    else:
+        await message.reply_text('Kullanım: yasaklı kişinin mesajına yanıt verip /unsiktir veya /unsiktir USER_ID')
+        return
+
     try:
-        await context.bot.unban_chat_member(update.effective_chat.id,uid,only_if_banned=True)
-        with closing(connect()) as con: con.execute('DELETE FROM bans WHERE chat_id=? AND user_id=?',(update.effective_chat.id,uid));con.commit()
-        await delete_admin_command(update)
-        await audit(context,update.effective_chat.id,'UNBAN',update.effective_user.id,uid)
-    except Exception as e: await update.effective_message.reply_text(f'Unban başarısız: {e}')
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=uid, only_if_banned=True)
+    except Exception as e:
+        log.exception('Unban failed chat=%s target=%s', chat_id, uid)
+        await message.reply_text(f'Yasak kaldırma başarısız: {e}')
+        return
 
-
-async def mute_user(update,context,temporary=False):
-    if not await admin_gate(update,context):return
-    user=await target_reply(update)
-    if not user:return
-    mins=int(context.args[0]) if context.args and context.args[0].isdigit() else 60
-    mins=max(1,min(mins,10080))
     try:
-        await context.bot.restrict_chat_member(update.effective_chat.id,user.id,ChatPermissions(can_send_messages=False),until_date=int(time.time())+mins*60)
-        await delete_admin_command(update)
-        await audit(context,update.effective_chat.id,'TEMPMUTE' if temporary else 'MUTE',update.effective_user.id,user.id)
-    except Exception as e: await update.effective_message.reply_text(f'Susturma başarısız: {e}')
+        with closing(connect()) as con:
+            con.execute('DELETE FROM bans WHERE chat_id=? AND user_id=?', (chat_id, uid))
+            con.execute('DELETE FROM temp_bans WHERE chat_id=? AND user_id=?', (chat_id, uid))
+            con.commit()
+    except Exception:
+        log.exception('Unban succeeded but local ban records could not be cleared')
+    await delete_command_after_success(update)
+    await context.bot.send_message(chat_id, f'{uid} kullanıcısının yasağı kaldırıldı.')
+    await safe_audit(context, chat_id, 'UNBAN', update.effective_user.id, uid)
 
+async def mute_user(update, context, temporary=False):
+    if not await admin_gate(update, context):
+        return
+    if not await moderation_bot_permission(update, context):
+        return
+    message = update.effective_message
+    user = await target_reply(update)
+    if not user:
+        return
 
-async def unmute(update,context):
-    if not await admin_gate(update,context):return
-    user=await target_reply(update)
-    if not user:return
-    perms=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True)
+    mins = int(context.args[0]) if context.args and context.args[0].isdigit() else 60
+    mins = max(1, min(mins, 10080))
     try:
-        await context.bot.restrict_chat_member(update.effective_chat.id,user.id,perms)
-        await delete_admin_command(update)
-        await audit(context,update.effective_chat.id,'UNMUTE',update.effective_user.id,user.id)
-    except Exception as e: await update.effective_message.reply_text(f'İşlem başarısız: {e}')
+        permissions = ChatPermissions(can_send_messages=False)
+        if temporary:
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user.id,
+                permissions=permissions,
+                until_date=int(time.time()) + mins * 60
+            )
+        else:
+            # /mute is indefinite; /tempmute is time-limited.
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=user.id,
+                permissions=permissions
+            )
+    except Exception as e:
+        log.exception('Mute failed chat=%s target=%s', update.effective_chat.id, user.id)
+        await message.reply_text(f'Susturma başarısız. Botun “Üyeleri yasakla” izni açık mı?\nTelegram: {e}')
+        return
 
+    await delete_command_after_success(update)
+    if temporary:
+        await context.bot.send_message(update.effective_chat.id, f'{user.full_name} {mins} dakika susturuldu.')
+    else:
+        await context.bot.send_message(update.effective_chat.id, f'{user.full_name} susturuldu. Açmak için /unmute kullan.')
+    await safe_audit(context, update.effective_chat.id, 'TEMPMUTE' if temporary else 'MUTE', update.effective_user.id, user.id)
+
+async def unmute(update, context):
+    if not await admin_gate(update, context):
+        return
+    if not await moderation_bot_permission(update, context):
+        return
+    message = update.effective_message
+    user = await target_reply(update)
+    if not user:
+        return
+    permissions = ChatPermissions(
+        can_send_messages=True, can_send_audios=True, can_send_documents=True,
+        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+        can_add_web_page_previews=True
+    )
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=update.effective_chat.id, user_id=user.id, permissions=permissions
+        )
+    except Exception as e:
+        log.exception('Unmute failed chat=%s target=%s', update.effective_chat.id, user.id)
+        await message.reply_text(f'Susturma kaldırılamadı: {e}')
+        return
+    await delete_command_after_success(update)
+    await context.bot.send_message(update.effective_chat.id, f'{user.full_name} susturması kaldırıldı.')
+    await safe_audit(context, update.effective_chat.id, 'UNMUTE', update.effective_user.id, user.id)
 
 async def kick(update,context):
     if not await admin_gate(update,context):return
@@ -374,25 +606,67 @@ async def kick(update,context):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id,user.id)
         await context.bot.unban_chat_member(update.effective_chat.id,user.id,only_if_banned=True)
-        await delete_admin_command(update)
+        await update.effective_message.reply_text(f'{user.full_name} gruptan çıkarıldı; yeniden katılabilir.')
         await audit(context,update.effective_chat.id,'KICK',update.effective_user.id,user.id)
     except Exception as e: await update.effective_message.reply_text(f'Çıkarma başarısız: {e}')
 
 
-async def warn(update,context):
-    if not await admin_gate(update,context):return
-    user=await target_reply(update)
-    if not user:return
-    cid=update.effective_chat.id
-    with closing(connect()) as con:
-        con.execute('INSERT INTO warnings VALUES(?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1',(cid,user.id));con.commit()
-        count=con.execute('SELECT count FROM warnings WHERE chat_id=? AND user_id=?',(cid,user.id)).fetchone()[0]
-    try:
-        await context.bot.restrict_chat_member(cid,user.id,ChatPermissions(can_send_messages=False))
-        await delete_admin_command(update)
-    except Exception as e: await update.effective_message.reply_text(f'Uyarı kaydedildi ancak susturma başarısız: {e}')
-    await audit(context,cid,'WARN_PERMANENT_MUTE',update.effective_user.id,user.id)
+async def warn(update, context):
+    if not await admin_gate(update, context):
+        return
+    user = await target_reply(update)
+    if not user:
+        return
+    chat_id = update.effective_chat.id
 
+    try:
+        with closing(connect()) as con:
+            con.execute(
+                'INSERT INTO warnings VALUES(?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1',
+                (chat_id, user.id)
+            )
+            con.commit()
+            count = con.execute(
+                'SELECT count FROM warnings WHERE chat_id=? AND user_id=?',
+                (chat_id, user.id)
+            ).fetchone()[0]
+    except Exception as e:
+        log.exception('Warning record failed')
+        await update.effective_message.reply_text(f'Uyarı kaydedilemedi: {e}')
+        return
+
+    limit = max(1, int(setting(chat_id, 'warn_limit')))
+    if count >= limit:
+        if not await moderation_bot_permission(update, context):
+            await update.effective_message.reply_text(
+                f'⚠️ {user.full_name} uyarıldı ({count}/{limit}), ancak otomatik susturma için bot izni eksik.'
+            )
+            return
+        mins = max(1, min(int(setting(chat_id, 'mute_minutes')), 10080))
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(time.time()) + mins * 60
+            )
+        except Exception as e:
+            log.exception('Threshold mute failed')
+            await update.effective_message.reply_text(
+                f'⚠️ Uyarı kaydedildi ({count}/{limit}), ancak {mins} dakika susturma başarısız: {e}'
+            )
+            return
+        await delete_command_after_success(update)
+        await context.bot.send_message(
+            chat_id, f'⚠️ {user.full_name} uyarıldı ({count}/{limit}) ve {mins} dakika susturuldu.'
+        )
+        await safe_audit(context, chat_id, 'WARN_THRESHOLD_MUTE', update.effective_user.id, user.id)
+    else:
+        await delete_command_after_success(update)
+        await context.bot.send_message(
+            chat_id, f'⚠️ {user.full_name} uyarıldı. Uyarı: {count}/{limit}.'
+        )
+        await safe_audit(context, chat_id, 'WARN', update.effective_user.id, user.id)
 
 async def warnings(update,context):
     if not await admin_gate(update,context):return
@@ -693,17 +967,14 @@ async def service_messages(update,context):
                         except Exception: log.exception('Age gate failed for user=%s',u.id)
                     elif setting(update.effective_chat.id,'welcome')=='on':
                         await context.bot.send_message(update.effective_chat.id,f'Hoş geldin, {u.full_name}! GAYZONE grubuna hoş geldin.')
-            # Telegram'ın katıldı/ayrıldı/çıkarıldı servis mesajları grup sohbetinde görünmesin.
-            # Botun yönetici olması ve mesaj silme izni bulunması gerekir.
-            if setting(update.effective_chat.id,'service_cleanup')=='on' or m.left_chat_member:
-                await m.delete()
+            if setting(update.effective_chat.id,'service_cleanup')=='on': await m.delete()
         except Exception:log.exception('Service message handling failed')
 
 handlers=[
  CommandHandler('start',start),CommandHandler(['bilgi','yardim','help'],bilgi),CommandHandler('yas18',yas18),CommandHandler('panel',panel),
  CommandHandler(['siktir','ban','banla'],ban_cmd),CommandHandler(['unsiktir','unban'],unban),CommandHandler('banlist',banlist),
- CommandHandler('mute',mute_user),CommandHandler('tempmute',lambda u,c: mute_user(u,c,True)),CommandHandler('unmute',unmute),
- CommandHandler('tempban',tempban),CommandHandler('kick',kick),CommandHandler('warn',warn),CommandHandler(['warns','warnings'],warnings),CommandHandler('unwarn',unwarn),CommandHandler(['resetwarns','warnreset'],warnreset),
+ CommandHandler(['mute','var'],mute_user),CommandHandler('tempmute',lambda u,c: mute_user(u,c,True)),CommandHandler('unmute',unmute),
+ CommandHandler('tempban',tempban),CommandHandler('kick',kick),CommandHandler(['warn','uyar'],warn),CommandHandler(['warns','warnings'],warnings),CommandHandler('unwarn',unwarn),CommandHandler(['resetwarns','warnreset'],warnreset),
  CommandHandler('info',info),CommandHandler('id',id_cmd),CommandHandler(['del','temizle'],delete_cmd),CommandHandler('purge',purge),
  CommandHandler('pin',pin),CommandHandler('unpin',unpin),CommandHandler('unpinall',unpinall),CommandHandler('pinned',pinned),
  CommandHandler('duyuru',announce),CommandHandler('fotoduyuru',photo_announce),CommandHandler('duyuruduzenle',announcement_edit),CommandHandler('duyurular',announcements),CommandHandler('duyurudurdur',lambda u,c: announcement_action(u,c,'durdur')),
@@ -713,6 +984,7 @@ handlers=[
  CallbackQueryHandler(panel_callback),MessageHandler(filters.StatusUpdate.ALL,service_messages),
  MessageHandler((filters.TEXT|filters.CAPTION)&~filters.COMMAND,moderate)
 ]
+bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_user), group=-1)
 for h in handlers: bot_app.add_handler(h)
 
 @api.on_event('startup')
