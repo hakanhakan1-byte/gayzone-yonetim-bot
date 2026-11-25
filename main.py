@@ -215,8 +215,24 @@ async def start(update, context):
 
 
 async def bilgi(update, context):
-    # /bilgi now opens the same management panel as /panel.
+    # /bilgi opens the management panel in groups and private chats.
     await panel(update, context)
+
+
+def resolve_panel_group(user_id):
+    """Find the user's GAYZONE group previously seen by this bot."""
+    with closing(connect()) as con:
+        row = con.execute(
+            "SELECT value FROM settings WHERE chat_id=? AND key='panel_group_id'",
+            (user_id,)
+        ).fetchone()
+        if row and str(row[0]).lstrip('-').isdigit():
+            return int(row[0])
+        row = con.execute(
+            'SELECT chat_id FROM known_users WHERE user_id=? ORDER BY last_seen DESC LIMIT 1',
+            (user_id,)
+        ).fetchone()
+    return int(row[0]) if row else None
 
 async def yas18(update, context):
     if not is_group(update):
@@ -312,9 +328,37 @@ async def help_cmd(update, context):
 
 
 async def panel(update, context):
-    if not await admin_gate(update,context): return
-    c=update.effective_chat.id
-    await set_command_menus(context,c)
+    if not update.effective_message or not update.effective_user or not update.effective_chat:
+        return
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+
+    if is_group(update):
+        if not await admin_gate(update, context):
+            return
+        c = chat.id
+        # Remember which group this administrator wants to manage from private chat.
+        set_setting(user_id, 'panel_group_id', str(c))
+    else:
+        c = resolve_panel_group(user_id)
+        if not c:
+            await update.effective_message.reply_text(
+                'GAYZONE yönetim panelini bağlamak için önce GAYZONE grubunda '
+                '/panel komutunu bir kez kullan. Sonrasında buradan /bilgi ile açabilirsin.'
+            )
+            return
+        try:
+            member = await context.bot.get_chat_member(c, user_id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await update.effective_message.reply_text('Bu panel yalnızca GAYZONE grup yöneticilerine açıktır.')
+                return
+        except Exception:
+            await update.effective_message.reply_text(
+                'GAYZONE yöneticiliğin doğrulanamadı. Botun grupta yönetici olduğundan emin ol.'
+            )
+            return
+
+    await set_command_menus(context, c)
     buttons = [
       [InlineKeyboardButton('👥 ÜYE YÖNETİMİ',callback_data='panel:members'),InlineKeyboardButton('🛡 GÜVENLİK',callback_data='panel:safety')],
       [InlineKeyboardButton('📢 DUYURULAR',callback_data='announcements'),InlineKeyboardButton('🚫 BAN LİSTESİ',callback_data='banlist:0')],
@@ -352,12 +396,20 @@ async def panel_callback(update, context):
         else:
             await q.answer('Yaş seçimi geçersiz.',show_alert=True)
         return
+    # Buttons sent in a private chat must act on the linked GAYZONE group,
+    # not on the administrator's private chat ID.
+    if q.message.chat.type == ChatType.PRIVATE:
+        target_group_id = resolve_panel_group(q.from_user.id)
+        if not target_group_id:
+            await q.answer('GAYZONE grubu panelle bağlantılı değil. Grupta /panel komutunu bir kez kullan.',show_alert=True)
+            return
+        chat_id = target_group_id
     try:
         member=await context.bot.get_chat_member(chat_id,q.from_user.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):
             await q.answer('Bu panel yalnızca yöneticilere açık.',show_alert=True); return
     except Exception:
-        await q.answer('Yönetici yetkisi doğrulanamadı.',show_alert=True); return
+        await q.answer('GAYZONE yöneticiliği doğrulanamadı.',show_alert=True); return
     data=q.data
     if data.startswith('toggle:'):
         key=data.split(':',1)[1]
